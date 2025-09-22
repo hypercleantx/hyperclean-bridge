@@ -3,6 +3,8 @@ const WebSocket = require('ws');
 const claude = require('./providers/claude');
 const tts = require('./tts');
 const security = require('./security');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -11,6 +13,10 @@ app.use(security.rateLimiter);
 
 const PORT = process.env.PORT || 3000;
 const RENDER_URL = process.env.RENDER_URL || `http://localhost:${PORT}`;
+
+const CACHE_DIR = process.env.TTS_CACHE_DIR || '/tmp/tts_cache';
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+app.use('/audio', require('express').static(CACHE_DIR));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -21,19 +27,12 @@ app.get('/health', (req, res) => {
 app.post('/voice/ai', security.validateTwilio, async (req, res) => {
   try {
     const { From, To, CallSid, SpeechResult } = req.body;
-    
-    // Get Claude response
     const context = { from: From, to: To, callSid: CallSid };
     const completion = await claude.getCompletion(SpeechResult || 'Hello', context);
-    
-    // Generate TTS
     const audioUrl = await tts.generateAudio(completion.text);
-    
-    // Return TwiML
-    const twiml = audioUrl 
+    const twiml = audioUrl
       ? `<?xml version="1.0" encoding="UTF-8"?><Response><Play>${audioUrl}</Play></Response>`
       : `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">${completion.text}</Say></Response>`;
-    
     res.type('text/xml');
     res.send(twiml);
   } catch (error) {
@@ -43,24 +42,39 @@ app.post('/voice/ai', security.validateTwilio, async (req, res) => {
   }
 });
 
-// Outbound call TwiML
+// Outbound call TwiML (PM calling)
 app.post('/outbound/twiml', (req, res) => {
-  const data = JSON.parse(req.query.data || '{}');
+  const { company = 'your property' } = req.query;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Hello, this is HyperClean TX calling about partnership opportunities for ${data.company || 'your property'}.</Say>
-  <Gather input="speech" timeout="3" action="${RENDER_URL}/voice/ai" method="POST">
-    <Say>How can we help keep your residents happy with professional cleaning services?</Say>
+  <Say voice="alice">Hi! This is Maria from HyperClean TX. We provide bilingual cleaning services that keep residents happy.</Say>
+  <Pause length="1"/>
+  <Say>We'd like to offer ${company} free placement in our resident portal, plus promotional flyers at no cost.</Say>
+  <Gather numDigits="1" timeout="5" action="${RENDER_URL}/outbound/gather">
+    <Say>Press 1 or say YES to receive our partnership details by email.</Say>
   </Gather>
+  <Say>Thank you for your time. Have a great day!</Say>
 </Response>`;
-  res.type('text/xml');
-  res.send(twiml);
+  res.type('text/xml').send(twiml);
 });
 
-// Call status webhook
+// Call status webhook for outbound
 app.post('/outbound/status', (req, res) => {
-  console.log('Call status:', req.body.CallStatus, req.body.CallSid);
+  const { CallSid, CallStatus, To } = req.body;
+  console.log(`Call ${CallSid} to ${To}: ${CallStatus}`);
   res.sendStatus(200);
+});
+
+// Gather endpoint for outbound call
+app.post('/outbound/gather', (req, res) => {
+  const { Digits, SpeechResult } = req.body;
+  if (Digits === '1' || /yes/i.test(SpeechResult)) {
+    res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response><Say>Perfect! We'll email you our partnership packet today. Thank you!</Say></Response>`);
+  } else {
+    res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response><Say>No problem. Feel free to call us at 832-784-8994 anytime. Goodbye!</Say></Response>`);
+  }
 });
 
 // WebSocket for Conversation Relay
@@ -75,17 +89,11 @@ wss.on('connection', (ws) => {
     try {
       const message = JSON.parse(data);
       const { speech, context } = message;
-      
-      // Process with Claude
       const completion = await claude.streamCompletion(speech?.text || '', context);
-      
-      // Generate TTS if needed
       let audioUrl = null;
       if (completion.text) {
         audioUrl = await tts.generateAudio(completion.text);
       }
-      
-      // Send response
       ws.send(JSON.stringify({
         text: completion.text,
         audioUrl,
